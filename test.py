@@ -1,6 +1,23 @@
 import requests
 import re
 import json
+import difflib
+
+headers_raw = """User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0
+Connection: keep-alive
+Upgrade-Insecure-Requests: 1
+Sec-Fetch-Dest: document
+Sec-Fetch-Mode: navigate
+Sec-Fetch-Site: none
+Sec-Fetch-User: ?1
+Priority: u=0, i
+TE: trailers"""
+
+headers = {}
+for line in headers_raw.split("\n"):
+    key, value = line.split(": ", 1)
+    headers[key] = value
+
 
 # 目标网址
 url = "https://yuc.wiki/202410/"
@@ -58,13 +75,15 @@ def data1(html_content):
             block,
             re.DOTALL,
         )
-        platform_list = []
+        platform_dict = {}
         for platform in platforms:
             platform_url = platform[0]
             platform_name = platform[1].strip()
-            platform_list.append(
-                {"platform_name": platform_name, "platform_url": platform_url}
-            )
+            # 判断platform_name是否存在于platform_dict中
+            if platform_name in platform_dict:
+                platform_dict[platform_name].append(platform_url)
+            else:
+                platform_dict[platform_name] = [platform_url]
 
         # Append the extracted data to the anime_list
         anime_list.append(
@@ -73,7 +92,7 @@ def data1(html_content):
                 "image_url": image_url,
                 "start_date": start_date,
                 "time": time,
-                "platforms": platform_list,
+                "platforms": platform_dict,
             }
         )
 
@@ -187,27 +206,117 @@ def data2(html_content):
     return anime_list
 
 
+def extract_anime_info(html_content):
+    url = "https://bgm.tv/index/63762"
+    response = requests.get(url, headers=headers)
+    response.encoding = "utf-8"
+    html_content = response.text
+    print(html_content)
+
+    # 匹配番剧名和上映情况的正则表达式
+    pattern = (
+        r'<a href="/subject/\d+" class="l">(.*?)</a>.*?<div class="text">(.*?)</div>'
+    )
+
+    # 使用正则表达式查找所有匹配项
+    matches = re.findall(pattern, html_content, re.DOTALL)
+
+    # 处理匹配结果
+    anime_list = [(title, info.strip()) for title, info in matches]
+    anime_dict = {}
+
+    for anime in anime_list:
+        title, info = anime
+        anime_dict[title] = info
+
+    print(anime_dict)
+
+    return anime_dict
+
+
 def merge_anime_lists(list1, list2):
     merged_dict = {}
 
     def normalize_name(name):
-        return re.sub(r"\s+", "", name)
+        return re.sub(r"\s+", "", name).lower()
+
+    def is_similar(name1, name2, threshold=0.8):
+        return (
+            difflib.SequenceMatcher(None, name1, name2).ratio() > threshold
+            or name1 in name2
+            or name2 in name1
+        )
+
+    def normalize_url(url):
+        return url.strip().lower()
 
     for anime in list1:
-        name = normalize_name(anime["name"])
-        if name not in merged_dict:
-            merged_dict[name] = anime
+        image_url = normalize_url(anime["image_url"])
+        name = anime["name"]
+        if image_url not in merged_dict:
+            merged_dict[image_url] = anime
         else:
-            merged_dict[name].update(anime)
+            merged_dict[image_url].update(anime)
 
     for anime in list2:
-        name = normalize_name(anime["name"])
-        if name not in merged_dict:
-            merged_dict[name] = anime
+        cover_image_url = normalize_url(anime["cover_image_url"])
+        name = anime["name"]
+        if cover_image_url in merged_dict:
+            merged_dict[cover_image_url].update(anime)
         else:
-            merged_dict[name].update(anime)
+            merged_dict[cover_image_url] = anime
 
-    return merged_dict
+    # Convert merged_dict to use names as keys
+    final_dict = {}
+    for anime in merged_dict.values():
+        name = anime["name"]
+        final_dict[name] = anime
+
+    url = "https://bgmlist.com/api/v1/bangumi/onair"
+    response = requests.get(url)
+    response.encoding = "utf-8"
+    html_content_1 = json.loads(response.text)["items"]
+
+    name_to_japanese_title = {}
+    for name, anime in final_dict.items():
+        if "japanese_title" in anime:
+            name_to_japanese_title[normalize_url(anime["japanese_title"])] = name
+
+    unmatched_items = []
+    for item in html_content_1:
+        title = normalize_url(item["title"])
+        matched = False
+        for existing_title in name_to_japanese_title:
+            if is_similar(title, existing_title):
+                name = name_to_japanese_title[existing_title]
+                final_dict[name]["bgmlist"] = item
+                matched = True
+                break
+        if not matched:
+            unmatched_items.append(item)
+
+    # Match unmatched items using zh-Hans
+    for item in unmatched_items:
+        for zh_hans in item.get("zh-Hans", []):
+            title = normalize_url(zh_hans)
+            for existing_title in name_to_japanese_title:
+                if is_similar(title, existing_title):
+                    name = name_to_japanese_title[existing_title]
+                    final_dict[name]["bgmlist"] = item
+                    break
+
+    extract_anime_data = extract_anime_info(html_content)
+    # Integrate extract_anime_data into final_dict
+    for japanese_name, data in extract_anime_data.items():
+        normalized_japanese_name = normalize_name(japanese_name)
+        for name, anime in final_dict.items():
+            if anime.get("japanese_title") and is_similar(
+                normalized_japanese_name, normalize_name(anime["japanese_title"])
+            ):
+                final_dict[name]["bilibili"] = data
+                break
+
+    return final_dict
 
 
 if __name__ == "__main__":
@@ -215,7 +324,11 @@ if __name__ == "__main__":
     anime_list1 = data1(html_content)
     anime_list2 = data2(html_content)
     merged_anime_list = merge_anime_lists(anime_list1, anime_list2)
-    print(merged_anime_list)
 
-    with open("anime_list.json", "w", encoding="utf-8") as f:
-        json.dump(merged_anime_list, f, ensure_ascii=False, indent=4)
+    with open("src/assets/anime_list.json", "w", encoding="utf-8") as f:
+        # 将i0.hdslb.com替换为s2.hdslb.com
+        f.write(
+            json.dumps(merged_anime_list, ensure_ascii=False, indent=4).replace(
+                "i0.hdslb.com", "s2.hdslb.com"
+            )
+        )

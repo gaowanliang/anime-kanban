@@ -1,1 +1,0 @@
-export const formatNumber = (number) => new Intl.NumberFormat(navigator.language).format(number);
